@@ -2,12 +2,23 @@ import os
 import json
 import random
 from datetime import datetime
+from threading import Thread
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Токен берется из переменной окружения на Render
+# ========== ЗАГЛУШКА ДЛЯ RENDER (ВЕБ-СЕРВЕР) ==========
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def hello():
+    return "🤖 Бот работает!"
+# =======================================================
+
+# ========== ТВОИ ДАННЫЕ ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-YOUR_USER_ID = 8420827188  # твой Telegram ID
+YOUR_USER_ID = 8420827188
+# =================================
 
 DATA_FILE = "mood_diary.json"
 
@@ -40,26 +51,32 @@ def get_random_caption(mood: str, track_title: str) -> str:
         "грустный": [
             f"🍂 Под грустинку — {track_title}. Выдохни.",
             f"😔 Грусть — это нормально. {track_title} — твой саундтрек.",
+            f"🌧️ {track_title} для тихого вечера. Держись!",
         ],
         "весёлый": [
             f"🎉 {track_title} — энергия зашкаливает!",
             f"😄 Этот трек про тебя сегодня! {track_title}",
+            f"💃 Танцуй под {track_title}!",
         ],
         "злой": [
             f"🤬 Выпусти пар под {track_title}. Громкость на максимум.",
             f"⚡ Злость — топливо. {track_title} в помощь.",
+            f"🔥 {track_title} — выруби звук и проорись.",
         ],
         "спокойный": [
             f"😌 {track_title} — музыка для внутреннего равновесия.",
             f"🌊 Расслабься. {track_title} тебя ждёт.",
+            f"🍃 {track_title} как тёплый ветер.",
         ],
         "влюблённый": [
             f"💘 {track_title} — это про тебя и твои чувства.",
             f"🌸 Весна в душе? {track_title} подтверждает.",
+            f"💕 {track_title} для двоих.",
         ],
         "уставший": [
             f"🛌 {track_title} — ложись и слушай.",
             f"😴 Устал? {track_title} обнимет звуком.",
+            f"🛋️ {track_title} для восстановления сил.",
         ],
         "случайное": [
             f"🎲 Держи случайный трек: {track_title}",
@@ -192,6 +209,9 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"\n• {e['date']} {e['time']} — {e['mood']}\n  🎵 {e['track_title']}"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+def run_flask():
+    app_web.run(host='0.0.0.0', port=10000)
+
 def main():
     if not BOT_TOKEN:
         print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
@@ -211,4 +231,8 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    # Запускаем Flask-сервер в отдельном потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    # Запускаем Telegram-бота
     main()
