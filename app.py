@@ -5,78 +5,68 @@ from datetime import datetime
 from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import TelegramError
 
-# ========== ЗАГЛУШКА ДЛЯ RENDER (ВЕБ-СЕРВЕР) ==========
+# ========== ЗАГЛУШКА ДЛЯ RENDER ==========
 app_web = Flask(__name__)
 
 @app_web.route('/')
 def hello():
-    return "🤖 Бот работает!"
-# =======================================================
+    return "🤖 Бот с музыкой работает!"
+# ========================================
 
-# ========== ТВОИ ДАННЫЕ ==========
+# ========== КОНФИГУРАЦИЯ ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 YOUR_USER_ID = 8420827188
 # =================================
 
 DATA_FILE = "mood_diary.json"
+# Временное хранилище для ожидающих добавления треков
+pending_tracks = {}
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"users": {}, "tracks": []}
+    return {"users": {}, "tracks": {"грустный": [], "весёлый": [], "злой": [], "спокойный": [], "влюблённый": [], "уставший": []}}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def add_track_to_library(title: str):
+def get_random_track_by_mood(mood: str):
     data = load_data()
-    if not any(t["title"] == title for t in data["tracks"]):
-        data["tracks"].append({"title": title})
-        save_data(data)
-        return True
-    return False
-
-def get_random_track():
-    data = load_data()
-    if not data["tracks"]:
+    tracks = data["tracks"].get(mood, [])
+    if not tracks:
         return None
-    return random.choice(data["tracks"])
+    return random.choice(tracks)
 
 def get_random_caption(mood: str, track_title: str) -> str:
     captions = {
         "грустный": [
             f"🍂 Под грустинку — {track_title}. Выдохни.",
             f"😔 Грусть — это нормально. {track_title} — твой саундтрек.",
-            f"🌧️ {track_title} для тихого вечера. Держись!",
         ],
         "весёлый": [
             f"🎉 {track_title} — энергия зашкаливает!",
             f"😄 Этот трек про тебя сегодня! {track_title}",
-            f"💃 Танцуй под {track_title}!",
         ],
         "злой": [
             f"🤬 Выпусти пар под {track_title}. Громкость на максимум.",
             f"⚡ Злость — топливо. {track_title} в помощь.",
-            f"🔥 {track_title} — выруби звук и проорись.",
         ],
         "спокойный": [
             f"😌 {track_title} — музыка для внутреннего равновесия.",
             f"🌊 Расслабься. {track_title} тебя ждёт.",
-            f"🍃 {track_title} как тёплый ветер.",
         ],
         "влюблённый": [
             f"💘 {track_title} — это про тебя и твои чувства.",
             f"🌸 Весна в душе? {track_title} подтверждает.",
-            f"💕 {track_title} для двоих.",
         ],
         "уставший": [
             f"🛌 {track_title} — ложись и слушай.",
             f"😴 Устал? {track_title} обнимет звуком.",
-            f"🛋️ {track_title} для восстановления сил.",
         ],
         "случайное": [
             f"🎲 Держи случайный трек: {track_title}",
@@ -121,35 +111,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 **Твой дневник настроения с музыкой**\n\n"
         "/mood — записать настроение + получить трек\n"
         "/random — случайный трек\n"
+        "/addfile — добавить новую песню (с выбором настроения)\n"
         "/stats — статистика\n"
         "/history — последние записи\n"
-        "/add — добавить трек в библиотеку\n"
-        "/tracks — показать все треки\n\n"
-        "📝 Сначала добавь пару треков через /add!",
+        "/library — показать сколько треков в каждом настроении\n\n"
+        "📝 Начни с /addfile — добавь первую песню!",
         parse_mode="Markdown"
     )
 
-async def add_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    if not context.args:
-        await update.message.reply_text("📝 Пример: `/add Название трека`")
-        return
-    title = " ".join(context.args)
-    if add_track_to_library(title):
-        await update.message.reply_text(f"✅ Трек «{title}» добавлен!")
-    else:
-        await update.message.reply_text(f"⚠️ Трек «{title}» уже есть.")
+    
+    keyboard = [
+        [InlineKeyboardButton("😢 Грустный", callback_data="addmood_грустный")],
+        [InlineKeyboardButton("😄 Весёлый", callback_data="addmood_весёлый")],
+        [InlineKeyboardButton("🤬 Злой", callback_data="addmood_злой")],
+        [InlineKeyboardButton("😌 Спокойный", callback_data="addmood_спокойный")],
+        [InlineKeyboardButton("💘 Влюблённый", callback_data="addmood_влюблённый")],
+        [InlineKeyboardButton("🛌 Уставший", callback_data="addmood_уставший")],
+    ]
+    await update.message.reply_text(
+        "🎵 **Добавляем новую песню**\n\n"
+        "Сначала выбери настроение для этой песни:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-async def list_tracks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addmood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != YOUR_USER_ID:
+        await query.edit_message_text("Это не твой бот 🙈")
+        return
+    
+    mood = query.data.replace("addmood_", "")
+    # Сохраняем выбранное настроение для пользователя
+    pending_tracks[query.from_user.id] = mood
+    await query.edit_message_text(
+        f"✅ Выбрано настроение: **{mood}**\n\n"
+        f"📤 Теперь **отправь аудиофайл песни** (mp3, m4a, и т.д.)\n\n"
+        f"Просто отправь файл в этот чат.",
+        parse_mode="Markdown"
+    )
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    data = load_data()
-    if not data["tracks"]:
-        await update.message.reply_text("📭 Библиотека пуста. /add")
+    
+    user_id = update.effective_user.id
+    # Проверяем, ждёт ли пользователь добавления трека
+    if user_id not in pending_tracks:
         return
-    tracks_list = "\n".join([f"• {t['title']}" for t in data["tracks"]])
-    await update.message.reply_text(f"🎵 Твоя библиотека:\n{tracks_list}")
+    
+    mood = pending_tracks[user_id]
+    audio = update.message.audio
+    
+    if not audio:
+        await update.message.reply_text("❌ Это не аудиофайл. Отправь песню как **аудио** (музыку).")
+        return
+    
+    # Получаем информацию о треке
+    title = audio.title or audio.file_name or "Без названия"
+    performer = audio.performer or ""
+    full_title = f"{performer} - {title}" if performer else title
+    
+    # Сохраняем в библиотеку
+    data = load_data()
+    track_info = {
+        "file_id": audio.file_id,
+        "title": full_title,
+        "performer": performer,
+        "file_name": audio.file_name
+    }
+    data["tracks"][mood].append(track_info)
+    save_data(data)
+    
+    # Очищаем ожидание
+    del pending_tracks[user_id]
+    
+    await update.message.reply_text(
+        f"✅ **Песня добавлена!**\n\n"
+        f"🎵 {full_title}\n"
+        f"😊 Настроение: {mood}\n\n"
+        f"Теперь эта песня будет приходить, когда ты выберешь «{mood}» в /mood",
+        parse_mode="Markdown"
+    )
 
 async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -172,24 +218,72 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     mood = query.data.replace("mood_", "")
-    track = get_random_track()
+    track = get_random_track_by_mood(mood)
     if not track:
-        await query.edit_message_text("📭 Библиотека пуста. Добавь треки через /add")
+        await query.edit_message_text(f"📭 В библиотеке пока нет песен для настроения **{mood}**.\n\nДобавь их через /addfile", parse_mode="Markdown")
         return
     
     caption = get_random_caption(mood, track["title"])
     save_mood_entry(YOUR_USER_ID, mood, track["title"])
-    await query.edit_message_text(f"🎵 **Настроение: {mood}**\n\n{caption}")
+    
+    try:
+        await context.bot.send_audio(
+            chat_id=query.message.chat_id,
+            audio=track["file_id"],
+            caption=caption,
+            performer=track.get("performer", ""),
+            title=track.get("title", "")
+        )
+        await query.message.delete()
+    except TelegramError as e:
+        await query.edit_message_text(f"❌ Ошибка при отправке: {e}")
 
 async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    track = get_random_track()
-    if not track:
-        await update.message.reply_text("Библиотека пуста. /add")
+    
+    # Собираем все треки из всех настроений
+    data = load_data()
+    all_tracks = []
+    for mood_tracks in data["tracks"].values():
+        all_tracks.extend(mood_tracks)
+    
+    if not all_tracks:
+        await update.message.reply_text("📭 Библиотека пуста. Добавь песни через /addfile")
         return
+    
+    track = random.choice(all_tracks)
     caption = get_random_caption("случайное", track["title"])
-    await update.message.reply_text(f"🎲 **Случайный трек**\n\n{caption}")
+    
+    try:
+        await context.bot.send_audio(
+            chat_id=update.message.chat_id,
+            audio=track["file_id"],
+            caption=caption,
+            performer=track.get("performer", ""),
+            title=track.get("title", "")
+        )
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != YOUR_USER_ID:
+        return
+    
+    data = load_data()
+    stats = []
+    for mood, tracks in data["tracks"].items():
+        if tracks:
+            stats.append(f"• {mood}: {len(tracks)} треков")
+    
+    if not stats:
+        await update.message.reply_text("📭 Библиотека пуста. Добавь песни через /addfile")
+        return
+    
+    await update.message.reply_text(
+        "📚 **Твоя музыкальная библиотека по настроениям:**\n\n" + "\n".join(stats),
+        parse_mode="Markdown"
+    )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -219,20 +313,22 @@ def main():
     
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_track))
-    app.add_handler(CommandHandler("tracks", list_tracks))
+    app.add_handler(CommandHandler("addfile", addfile_command))
     app.add_handler(CommandHandler("mood", mood_command))
     app.add_handler(CommandHandler("random", random_track))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("library", library_command))
+    app.add_handler(CallbackQueryHandler(addmood_callback, pattern="^addmood_"))
     app.add_handler(CallbackQueryHandler(mood_callback, pattern="^mood_"))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     
     print("🤖 Бот запущен на Render!")
+    
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
     app.run_polling()
 
 if __name__ == "__main__":
-    # Запускаем Flask-сервер в отдельном потоке
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    # Запускаем Telegram-бота
     main()
