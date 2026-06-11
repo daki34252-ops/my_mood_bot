@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from threading import Thread
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Audio
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 import requests
@@ -33,8 +33,8 @@ YOUR_USER_ID = 8420827188
 # =================================
 
 DATA_FILE = "mood_diary.json"
-pending_tracks = {}
-pending_rating = {}  # {user_id: {"track_title": "...", "track_file_id": "...", "mood": "..."}}
+pending_tracks = {}  # {user_id: mood}
+pending_rating = {}  # не используется пока, но оставим на будущее
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -120,9 +120,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 **Твой дневник настроения с музыкой**\n\n"
         "/mood — записать настроение + получить трек\n"
         "/random — случайный трек\n"
-        "/addfile — добавить новую песню\n"
+        "/addfile — добавить новую песню (можно несколько за раз)\n"
+        "/cancel — выйти из режима добавления\n"
         "/stats — статистика дневника\n"
-        "/ratings — статистика оценок треков\n"
+        "/ratings — топ треков по оценкам\n"
         "/history — последние записи\n"
         "/library — сколько треков в каждом настроении\n\n"
         "📝 После прослушивания трека — оцени его звёздочками!",
@@ -157,51 +158,104 @@ async def addmood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_tracks[query.from_user.id] = mood
     await query.edit_message_text(
         f"✅ Выбрано настроение: **{mood}**\n\n"
-        f"📤 Теперь **отправь аудиофайл песни** (mp3, m4a...)\n\n"
-        f"Просто отправь файл в этот чат.",
+        f"📤 Теперь **отправь аудиофайл(ы) песен** (можно несколько, по одному или пачкой)\n\n"
+        f"🎵 Бот сохранит все песни в «{mood}»\n\n"
+        f"❌ Чтобы выйти из режима добавления — нажми /cancel",
         parse_mode="Markdown"
     )
+
+async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != YOUR_USER_ID:
+        return
+    
+    user_id = update.effective_user.id
+    if user_id in pending_tracks:
+        mood = pending_tracks[user_id]
+        del pending_tracks[user_id]
+        await update.message.reply_text(f"❌ Режим добавления в «{mood}» отменён.\n\nИспользуй /addfile, чтобы начать заново.")
+    else:
+        await update.message.reply_text("Ты и так не в режиме добавления.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
     
     user_id = update.effective_user.id
+    
     if user_id not in pending_tracks:
-        await update.message.reply_text("❌ Сначала используй /addfile")
+        await update.message.reply_text("❌ Сначала используй /addfile и выбери настроение")
         return
     
     mood = pending_tracks[user_id]
-    audio = update.message.audio
     
-    if not audio:
-        await update.message.reply_text("❌ Это не аудиофайл. Отправь песню как **аудио**.")
+    # Собираем все аудио из сообщения
+    audios = []
+    
+    if update.message.audio:
+        audios.append(update.message.audio)
+    
+    if update.message.audio_group:
+        audios.extend(update.message.audio_group)
+    
+    if not audios:
+        await update.message.reply_text("❌ Отправь аудиофайл(ы) с музыкой")
         return
     
-    title = audio.title or audio.file_name or "Без названия"
-    performer = audio.performer or ""
-    full_title = f"{performer} - {title}" if performer else title
+    saved_count = 0
+    duplicate_count = 0
+    saved_titles = []
     
-    data = load_data()
-    track_info = {
-        "file_id": audio.file_id,
-        "title": full_title,
-        "performer": performer,
-        "file_name": audio.file_name
-    }
-    data["tracks"][mood].append(track_info)
-    save_data(data)
+    for audio in audios:
+        title = audio.title or audio.file_name or "Без названия"
+        performer = audio.performer or ""
+        full_title = f"{performer} - {title}" if performer else title
+        
+        data = load_data()
+        
+        # Проверка на дубликат
+        is_duplicate = False
+        for existing in data["tracks"][mood]:
+            if existing.get("file_id") == audio.file_id:
+                is_duplicate = True
+                break
+        
+        if is_duplicate:
+            duplicate_count += 1
+            continue
+        
+        track_info = {
+            "file_id": audio.file_id,
+            "title": full_title,
+            "performer": performer,
+            "file_name": audio.file_name
+        }
+        data["tracks"][mood].append(track_info)
+        save_data(data)
+        saved_count += 1
+        saved_titles.append(full_title)
     
-    del pending_tracks[user_id]
-    
-    # ПОДТВЕРЖДЕНИЕ - вот то, чего не хватало!
-    await update.message.reply_text(
-        f"✅ **Песня успешно добавлена!**\n\n"
-        f"🎵 {full_title}\n"
-        f"😊 Настроение: {mood}\n\n"
-        f"Теперь эта песня будет играть, когда ты выберешь «{mood}» в /mood",
-        parse_mode="Markdown"
-    )
+    # Отправляем итоговое сообщение
+    if saved_count > 0:
+        titles_preview = "\n".join(saved_titles[:5])
+        if len(saved_titles) > 5:
+            titles_preview += f"\n... и ещё {len(saved_titles) - 5}"
+        
+        await update.message.reply_text(
+            f"🎵 **Добавление в «{mood}»**\n\n"
+            f"✅ Сохранено треков: {saved_count}\n"
+            f"{'⚠️ Пропущено дубликатов: ' + str(duplicate_count) if duplicate_count > 0 else ''}\n\n"
+            f"📝 Добавленные треки:\n{titles_preview}\n\n"
+            f"🎶 Режим добавления остаётся активным. Можешь отправить ещё файлы!\n"
+            f"❌ Чтобы выйти — нажми /cancel",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Не сохранено ни одного трека.\n"
+            f"{'Дубликатов: ' + str(duplicate_count) if duplicate_count > 0 else ''}\n\n"
+            f"🎶 Режим добавления остаётся активным.",
+            parse_mode="Markdown"
+        )
 
 async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -232,14 +286,7 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = get_random_caption(mood, track["title"])
     save_mood_entry(YOUR_USER_ID, mood, track["title"])
     
-    # Сохраняем информацию для оценки
-    pending_rating[YOUR_USER_ID] = {
-        "track_title": track["title"],
-        "track_file_id": track["file_id"],
-        "mood": mood
-    }
-    
-    # КНОПКИ ОЦЕНКИ (после отправки музыки)
+    # Кнопки оценки
     rating_keyboard = [
         [
             InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
@@ -254,7 +301,7 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_audio(
             chat_id=query.message.chat_id,
             audio=track["file_id"],
-            caption=f"{caption}\n\n🎵 {track['title']}\n\n⭐ **Оцени песню после прослушивания:**",
+            caption=f"{caption}\n\n⭐ **Оцени песню после прослушивания:**",
             performer=track.get("performer", ""),
             title=track.get("title", ""),
             reply_markup=InlineKeyboardMarkup(rating_keyboard)
@@ -273,9 +320,8 @@ async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data_parts = query.data.split("_")
     rating = int(data_parts[1])
-    track_title = "_".join(data_parts[2:])  # Восстанавливаем название с пробелами
+    track_title = "_".join(data_parts[2:])
     
-    # Сохраняем оценку
     add_rating(track_title, rating)
     
     await query.edit_message_text(
@@ -295,16 +341,12 @@ async def ratings_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("📭 Пока нет оценок. Послушай музыку и оцени через /mood")
         return
     
-    # Собираем статистику по трекам
     stats = []
     for track, ratings in data["ratings"].items():
         avg = sum(ratings) / len(ratings)
         stats.append(f"• {track}: {avg:.1f}/5 ({len(ratings)} оценок)")
     
-    # Сортируем по средней оценке
     stats.sort(key=lambda x: float(x.split(": ")[1].split("/")[0]), reverse=True)
-    
-    # Берём топ-10
     top_stats = stats[:10]
     
     await update.message.reply_text(
@@ -330,11 +372,11 @@ async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     rating_keyboard = [
         [
-            InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton("⭐⭐ 2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐ 3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐ 4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐⭐ 5", callback_data=f"rate_5_{track['title']}")
+            InlineKeyboardButton(" 1", callback_data=f"rate_1_{track['title']}"),
+            InlineKeyboardButton(" 2", callback_data=f"rate_2_{track['title']}"),
+            InlineKeyboardButton(" 3", callback_data=f"rate_3_{track['title']}"),
+            InlineKeyboardButton(" 4", callback_data=f"rate_4_{track['title']}"),
+            InlineKeyboardButton(" 5", callback_data=f"rate_5_{track['title']}")
         ]
     ]
     
@@ -342,7 +384,7 @@ async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_audio(
             chat_id=update.message.chat_id,
             audio=track["file_id"],
-            caption=f"{caption}\n\n🎵 {track['title']}\n\n⭐ **Оцени песню:**",
+            caption=f"{caption}\n\n⭐ **Оцени песню:**",
             performer=track.get("performer", ""),
             title=track.get("title", ""),
             reply_markup=InlineKeyboardMarkup(rating_keyboard)
@@ -387,6 +429,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"\n• {e['date']} {e['time']} — {e['mood']}\n  🎵 {e['track_title']}"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# ========== АВТОПИНГ ==========
 def keep_alive():
     url = f"https://{os.environ.get('RENDER_SERVICE_NAME', 'my-mood-bot')}.onrender.com/ping"
     while True:
@@ -400,6 +443,7 @@ def keep_alive():
 def run_flask():
     app_web.run(host='0.0.0.0', port=10000)
 
+# ========== ЗАПУСК ==========
 def main():
     if not BOT_TOKEN:
         print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
@@ -408,6 +452,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addfile", addfile_command))
+    app.add_handler(CommandHandler("cancel", cancel_add))
     app.add_handler(CommandHandler("mood", mood_command))
     app.add_handler(CommandHandler("random", random_track))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -422,6 +467,7 @@ def main():
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
     print("⭐ Оценки треков через звёздочки — активны")
+    print("📁 Поддержка нескольких файлов — активна")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
