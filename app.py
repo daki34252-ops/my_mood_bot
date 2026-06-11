@@ -1,12 +1,11 @@
 import os
 import json
 import random
-import threading
 import time
 from datetime import datetime
 from threading import Thread
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Audio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 import requests
@@ -34,7 +33,6 @@ YOUR_USER_ID = 8420827188
 
 DATA_FILE = "mood_diary.json"
 pending_tracks = {}  # {user_id: mood}
-pending_rating = {}  # не используется пока, но оставим на будущее
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -43,7 +41,7 @@ def load_data():
     return {
         "users": {},
         "tracks": {"грустный": [], "весёлый": [], "злой": [], "спокойный": [], "влюблённый": [], "уставший": []},
-        "ratings": {}  # {track_title: [1,2,3,4,5]}
+        "ratings": {}
     }
 
 def save_data(data):
@@ -63,14 +61,6 @@ def add_rating(track_title: str, rating: int):
         data["ratings"][track_title] = []
     data["ratings"][track_title].append(rating)
     save_data(data)
-
-def get_track_rating_stats(track_title: str) -> str:
-    data = load_data()
-    ratings = data["ratings"].get(track_title, [])
-    if not ratings:
-        return "⭐ Нет оценок"
-    avg = sum(ratings) / len(ratings)
-    return f"⭐ Средняя оценка: {avg:.1f}/5 ({len(ratings)} оценок)"
 
 def get_random_caption(mood: str, track_title: str) -> str:
     captions = {
@@ -120,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 **Твой дневник настроения с музыкой**\n\n"
         "/mood — записать настроение + получить трек\n"
         "/random — случайный трек\n"
-        "/addfile — добавить новую песню (можно несколько за раз)\n"
+        "/addfile — добавить новую песню\n"
         "/cancel — выйти из режима добавления\n"
         "/stats — статистика дневника\n"
         "/ratings — топ треков по оценкам\n"
@@ -158,9 +148,8 @@ async def addmood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_tracks[query.from_user.id] = mood
     await query.edit_message_text(
         f"✅ Выбрано настроение: **{mood}**\n\n"
-        f"📤 Теперь **отправь аудиофайл(ы) песен** (можно несколько, по одному или пачкой)\n\n"
-        f"🎵 Бот сохранит все песни в «{mood}»\n\n"
-        f"❌ Чтобы выйти из режима добавления — нажми /cancel",
+        f"📤 Теперь **отправь аудиофайл(ы)** (можно несколько)\n\n"
+        f"❌ Чтобы выйти — /cancel",
         parse_mode="Markdown"
     )
 
@@ -172,9 +161,9 @@ async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in pending_tracks:
         mood = pending_tracks[user_id]
         del pending_tracks[user_id]
-        await update.message.reply_text(f"❌ Режим добавления в «{mood}» отменён.\n\nИспользуй /addfile, чтобы начать заново.")
+        await update.message.reply_text(f"❌ Режим добавления в «{mood}» отменён.")
     else:
-        await update.message.reply_text("Ты и так не в режиме добавления.")
+        await update.message.reply_text("Ты не в режиме добавления.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -183,26 +172,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_id not in pending_tracks:
-        await update.message.reply_text("❌ Сначала используй /addfile и выбери настроение")
+        await update.message.reply_text("❌ Сначала /addfile и выбери настроение")
         return
     
     mood = pending_tracks[user_id]
     
-    # Собираем все аудио из сообщения
+    # Собираем все аудио
     audios = []
-    
     if update.message.audio:
         audios.append(update.message.audio)
-    
     if update.message.audio_group:
         audios.extend(update.message.audio_group)
     
     if not audios:
-        await update.message.reply_text("❌ Отправь аудиофайл(ы) с музыкой")
+        await update.message.reply_text("❌ Отправь аудиофайл(ы)")
         return
     
     saved_count = 0
-    duplicate_count = 0
     saved_titles = []
     
     for audio in audios:
@@ -212,50 +198,35 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         data = load_data()
         
-        # Проверка на дубликат
-        is_duplicate = False
-        for existing in data["tracks"][mood]:
-            if existing.get("file_id") == audio.file_id:
-                is_duplicate = True
-                break
-        
-        if is_duplicate:
-            duplicate_count += 1
-            continue
-        
         track_info = {
             "file_id": audio.file_id,
             "title": full_title,
             "performer": performer,
             "file_name": audio.file_name
         }
+        
+        # Сохраняем ВСЕГДА, даже если дубликат (убираем проверку)
         data["tracks"][mood].append(track_info)
         save_data(data)
         saved_count += 1
         saved_titles.append(full_title)
-    
-    # Отправляем итоговое сообщение
-    if saved_count > 0:
-        titles_preview = "\n".join(saved_titles[:5])
-        if len(saved_titles) > 5:
-            titles_preview += f"\n... и ещё {len(saved_titles) - 5}"
         
-        await update.message.reply_text(
-            f"🎵 **Добавление в «{mood}»**\n\n"
-            f"✅ Сохранено треков: {saved_count}\n"
-            f"{'⚠️ Пропущено дубликатов: ' + str(duplicate_count) if duplicate_count > 0 else ''}\n\n"
-            f"📝 Добавленные треки:\n{titles_preview}\n\n"
-            f"🎶 Режим добавления остаётся активным. Можешь отправить ещё файлы!\n"
-            f"❌ Чтобы выйти — нажми /cancel",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"⚠️ Не сохранено ни одного трека.\n"
-            f"{'Дубликатов: ' + str(duplicate_count) if duplicate_count > 0 else ''}\n\n"
-            f"🎶 Режим добавления остаётся активным.",
-            parse_mode="Markdown"
-        )
+        # Небольшая задержка, чтобы файлы точно сохранились
+        time.sleep(0.1)
+    
+    # Показываем результат
+    titles_preview = "\n".join(saved_titles[:10])
+    if len(saved_titles) > 10:
+        titles_preview += f"\n... и ещё {len(saved_titles) - 10}"
+    
+    await update.message.reply_text(
+        f"🎵 **Добавление в «{mood}»**\n\n"
+        f"✅ Сохранено треков: {saved_count}\n\n"
+        f"📝 {titles_preview}\n\n"
+        f"🎶 Режим добавления активен. Отправляй ещё!\n"
+        f"❌ Выход — /cancel",
+        parse_mode="Markdown"
+    )
 
 async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -286,7 +257,6 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = get_random_caption(mood, track["title"])
     save_mood_entry(YOUR_USER_ID, mood, track["title"])
     
-    # Кнопки оценки
     rating_keyboard = [
         [
             InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
@@ -338,7 +308,7 @@ async def ratings_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     data = load_data()
     if not data["ratings"]:
-        await update.message.reply_text("📭 Пока нет оценок. Послушай музыку и оцени через /mood")
+        await update.message.reply_text("📭 Пока нет оценок.")
         return
     
     stats = []
@@ -364,7 +334,7 @@ async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_tracks.extend(mood_tracks)
     
     if not all_tracks:
-        await update.message.reply_text("📭 Библиотека пуста. Добавь песни через /addfile")
+        await update.message.reply_text("📭 Библиотека пуста.")
         return
     
     track = random.choice(all_tracks)
@@ -403,7 +373,7 @@ async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats.append(f"• {mood}: {len(tracks)} треков")
     
     if not stats:
-        await update.message.reply_text("📭 Библиотека пуста. /addfile")
+        await update.message.reply_text("📭 Библиотека пуста.")
         return
     
     await update.message.reply_text(
@@ -467,7 +437,7 @@ def main():
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
     print("⭐ Оценки треков через звёздочки — активны")
-    print("📁 Поддержка нескольких файлов — активна")
+    print("📁 Сохранение всех файлов (включая дубликаты) — активно")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
