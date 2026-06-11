@@ -2,8 +2,6 @@ import os
 import json
 import random
 import time
-import asyncio
-import yt_dlp
 from datetime import datetime
 from threading import Thread
 from flask import Flask
@@ -40,7 +38,7 @@ def load_library():
     if os.path.exists(LIBRARY_FILE):
         with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []
+    return []  # [{"type": "audio" или "link", "title": "...", "value": "file_id или ссылка", "performer": "...", "date_added": "..."}]
 
 def save_library(library):
     with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
@@ -56,15 +54,16 @@ def save_diary(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def add_to_library(title: str, performer: str, file_id: str):
+def add_to_library(item_type: str, title: str, performer: str, value: str):
     library = load_library()
     for track in library:
-        if track.get("file_id") == file_id:
+        if track.get("value") == value:
             return False
     library.append({
+        "type": item_type,
         "title": title,
         "performer": performer,
-        "file_id": file_id,
+        "value": value,
         "date_added": datetime.now().strftime("%Y-%m-%d")
     })
     save_library(library)
@@ -125,54 +124,6 @@ def get_stats(user_id: int) -> str:
     mood_list = ", ".join([f"{k}: {v}" for k, v in moods.items()])
     return f"📊 Записей: {len(entries)}\n❤️ Чаще всего: {most_common} ({moods[most_common]} раз)\n{mood_list}"
 
-# ========== СКАЧИВАНИЕ С YOUTUBE (ИСПРАВЛЕННОЕ) ==========
-async def download_audio(url: str):
-    downloads_dir = "downloads"
-    os.makedirs(downloads_dir, exist_ok=True)
-    
-    # Используем fallback-форматы для совместимости с новыми изменениями YouTube [citation:5][citation:9]
-    ydl_opts = {
-        'format': 'bestaudio/best',  # Попроще, без обязательной конвертации
-        'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': 'cookies.txt',
-        'extract_flat': False,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'prefer_ffmpeg': True,
-        # Дополнительные опции для обхода SABR streaming [citation:5]
-        'extractor_args': {
-            'youtube': {
-                'skip': ['hls', 'dash'],  # Пропускаем некоторые типы потоков
-                'player_client': ['android', 'web'],  # Пробуем разные клиенты
-            }
-        }
-    }
-    
-    loop = asyncio.get_event_loop()
-    
-    def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if filename.endswith('.webm'):
-                new_filename = filename.replace('.webm', '.mp3')
-                if os.path.exists(new_filename):
-                    os.rename(filename, new_filename)
-                    filename = new_filename
-            elif not filename.endswith('.mp3'):
-                # Проверяем, есть ли mp3 файл (после конвертации)
-                base = os.path.splitext(filename)[0]
-                if os.path.exists(base + '.mp3'):
-                    filename = base + '.mp3'
-            return filename, info.get('title', 'Без названия'), info.get('uploader', 'Неизвестный исполнитель')
-    
-    return await loop.run_in_executor(None, download)
-
 # ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -182,53 +133,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 **Твой дневник настроения с музыкой**\n\n"
         "/mood — записать настроение + получить трек\n"
         "/random — случайный трек\n"
-        "/yt <ссылка> — скачать трек с YouTube\n"
-        "/library — количество треков в библиотеке\n"
+        "/addlink — добавить ссылку на песню\n"
+        "/library — количество треков/ссылок в библиотеке\n"
         "/ratings — топ треков по оценкам\n"
         "/stats — статистика дневника\n"
         "/history — последние записи\n\n"
-        "🎵 Просто отправь аудиофайл — бот сохранит его в библиотеку!\n"
-        "⭐ После прослушивания трека — оцени его звёздочками!",
+        "🎵 Отправь аудиофайл — бот сохранит его в библиотеку!\n"
+        "🔗 Используй /addlink, чтобы добавить ссылку\n"
+        "⭐ Оцени трек от 1 до 5 после прослушивания!",
         parse_mode="Markdown"
     )
 
-async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
     
     if not context.args:
-        await update.message.reply_text("❌ Использование: `/yt https://youtu.be/...`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Использование: `/addlink https://youtu.be/... Название трека`\n\nПример: `/addlink https://youtu.be/dQw4w9WgXcQ Rick Astley - Never Gonna Give You Up`", parse_mode="Markdown")
         return
     
     url = context.args[0]
-    status_msg = await update.message.reply_text("⏳ Скачиваю аудио с YouTube... Это может занять до минуты.")
+    if len(context.args) > 1:
+        title = " ".join(context.args[1:])
+    else:
+        title = url
     
-    try:
-        filename, title, performer = await download_audio(url)
-        
-        if not os.path.exists(filename):
-            await status_msg.edit_text("❌ Не удалось найти скачанный файл.")
-            return
-        
-        with open(filename, 'rb') as audio_file:
-            message = await context.bot.send_audio(
-                chat_id=update.message.chat_id,
-                audio=audio_file,
-                title=title[:64],
-                performer=performer[:64],
-                caption=f"🎵 **Скачано с YouTube**\n{title}\n{performer}\n\n💾 Трек сохранён в библиотеку!",
-                parse_mode='Markdown'
-            )
-        
-        if hasattr(message, 'audio') and message.audio:
-            file_id = message.audio.file_id
-            add_to_library(title, performer, file_id)
-        
-        os.remove(filename)
-        await status_msg.delete()
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка при скачивании: {e}")
+    if add_to_library("link", title, "Ссылка", url):
+        await update.message.reply_text(f"✅ Ссылка сохранена в библиотеку!\n🔗 {title}\n{url}")
+    else:
+        await update.message.reply_text(f"⚠️ Такая ссылка уже есть в библиотеке")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -242,7 +175,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     performer = audio.performer or "Неизвестный исполнитель"
     file_id = audio.file_id
     
-    if add_to_library(title, performer, file_id):
+    if add_to_library("audio", title, performer, file_id):
         await update.message.reply_text(f"✅ Трек сохранён в библиотеку!\n🎵 {title} — {performer}")
     else:
         await update.message.reply_text(f"⚠️ Трек уже есть в библиотеке")
@@ -270,7 +203,7 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mood = query.data.replace("mood_", "")
     track = get_random_track()
     if not track:
-        await query.edit_message_text("📭 Библиотека пуста. Добавь треки через /yt или отправь аудиофайл.")
+        await query.edit_message_text("📭 Библиотека пуста. Добавь треки через /addlink или отправь аудиофайл.")
         return
     
     caption = get_random_caption(mood, track["title"])
@@ -278,23 +211,31 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     rating_keyboard = [
         [
-            InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton("⭐⭐ 2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐ 3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐ 4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐⭐ 5", callback_data=f"rate_5_{track['title']}")
+            InlineKeyboardButton("1", callback_data=f"rate_1_{track['title']}"),
+            InlineKeyboardButton("2", callback_data=f"rate_2_{track['title']}"),
+            InlineKeyboardButton("3", callback_data=f"rate_3_{track['title']}"),
+            InlineKeyboardButton("4", callback_data=f"rate_4_{track['title']}"),
+            InlineKeyboardButton("5", callback_data=f"rate_5_{track['title']}")
         ]
     ]
     
     try:
-        await context.bot.send_audio(
-            chat_id=query.message.chat_id,
-            audio=track["file_id"],
-            caption=f"{caption}\n\n⭐ **Оцени песню после прослушивания:**",
-            performer=track.get("performer", ""),
-            title=track.get("title", ""),
-            reply_markup=InlineKeyboardMarkup(rating_keyboard)
-        )
+        if track["type"] == "audio":
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=track["value"],
+                caption=f"{caption}\n\n🎵 {track['title']} — {track['performer']}\n\n⭐ **Оцени трек от 1 до 5:**",
+                performer=track.get("performer", ""),
+                title=track.get("title", ""),
+                reply_markup=InlineKeyboardMarkup(rating_keyboard)
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"{caption}\n\n🔗 **Ссылка:** {track['value']}\n\n⭐ **Оцени трек от 1 до 5:**",
+                reply_markup=InlineKeyboardMarkup(rating_keyboard),
+                parse_mode='Markdown'
+            )
         await query.message.delete()
     except TelegramError as e:
         await query.edit_message_text(f"❌ Ошибка: {e}")
@@ -327,30 +268,38 @@ async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     track = get_random_track()
     if not track:
-        await update.message.reply_text("📭 Библиотека пуста. Добавь треки через /yt или отправь аудиофайл.")
+        await update.message.reply_text("📭 Библиотека пуста. Добавь треки через /addlink или отправь аудиофайл.")
         return
     
     caption = get_random_caption("случайное", track["title"])
     
     rating_keyboard = [
         [
-            InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton("⭐⭐ 2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐ 3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐ 4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton("⭐⭐⭐⭐⭐ 5", callback_data=f"rate_5_{track['title']}")
+            InlineKeyboardButton("1", callback_data=f"rate_1_{track['title']}"),
+            InlineKeyboardButton("2", callback_data=f"rate_2_{track['title']}"),
+            InlineKeyboardButton("3", callback_data=f"rate_3_{track['title']}"),
+            InlineKeyboardButton("4", callback_data=f"rate_4_{track['title']}"),
+            InlineKeyboardButton("5", callback_data=f"rate_5_{track['title']}")
         ]
     ]
     
     try:
-        await context.bot.send_audio(
-            chat_id=update.message.chat_id,
-            audio=track["file_id"],
-            caption=f"{caption}\n\n⭐ **Оцени песню:**",
-            performer=track.get("performer", ""),
-            title=track.get("title", ""),
-            reply_markup=InlineKeyboardMarkup(rating_keyboard)
-        )
+        if track["type"] == "audio":
+            await context.bot.send_audio(
+                chat_id=update.message.chat_id,
+                audio=track["value"],
+                caption=f"{caption}\n\n🎵 {track['title']} — {track['performer']}\n\n⭐ **Оцени трек от 1 до 5:**",
+                performer=track.get("performer", ""),
+                title=track.get("title", ""),
+                reply_markup=InlineKeyboardMarkup(rating_keyboard)
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text=f"{caption}\n\n🔗 **Ссылка:** {track['value']}\n\n⭐ **Оцени трек от 1 до 5:**",
+                reply_markup=InlineKeyboardMarkup(rating_keyboard),
+                parse_mode='Markdown'
+            )
     except TelegramError as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -359,8 +308,17 @@ async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     library = load_library()
-    count = len(library)
-    await update.message.reply_text(f"📚 **Твоя библиотека:**\n\nВсего треков: {count}", parse_mode="Markdown")
+    audio_count = len([t for t in library if t["type"] == "audio"])
+    link_count = len([t for t in library if t["type"] == "link"])
+    total = len(library)
+    
+    await update.message.reply_text(
+        f"📚 **Твоя библиотека:**\n\n"
+        f"🎵 Аудиофайлов: {audio_count}\n"
+        f"🔗 Ссылок: {link_count}\n"
+        f"📊 Всего треков: {total}",
+        parse_mode="Markdown"
+    )
 
 async def ratings_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -422,17 +380,9 @@ def main():
         print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
         return
     
-    # Обновляем yt-dlp и устанавливаем yt-dlp-ejs для обхода защиты YouTube [citation:5]
-    try:
-        import subprocess
-        subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'yt-dlp', 'yt-dlp-ejs'], capture_output=True)
-        print("✅ yt-dlp и yt-dlp-ejs установлены/обновлены")
-    except Exception as e:
-        print(f"⚠️ Не удалось обновить yt-dlp: {e}")
-    
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("yt", yt_command))
+    app.add_handler(CommandHandler("addlink", addlink_command))
     app.add_handler(CommandHandler("mood", mood_command))
     app.add_handler(CommandHandler("random", random_track))
     app.add_handler(CommandHandler("library", library_command))
@@ -445,7 +395,8 @@ def main():
     
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
-    print("🎵 Поддержка YouTube через /yt (с обходом SABR streaming)")
+    print("🎵 Сохранение аудиофайлов и ссылок")
+    print("⭐ Оценки от 1 до 5")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -456,5 +407,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    import sys
     main()
