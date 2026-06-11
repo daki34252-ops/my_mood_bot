@@ -34,14 +34,14 @@ YOUR_USER_ID = 8420827188
 # =================================
 
 DATA_FILE = "mood_diary.json"
-LIBRARY_FILE = "library.json"  # отдельный файл для библиотеки треков
+LIBRARY_FILE = "library.json"
 pending_ratings = {}
 
 def load_library():
     if os.path.exists(LIBRARY_FILE):
         with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []  # список треков: [{"title": "...", "file_id": "...", "performer": "..."}]
+    return []
 
 def save_library(library):
     with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
@@ -59,7 +59,6 @@ def save_diary(data):
 
 def add_to_library(title: str, performer: str, file_id: str):
     library = load_library()
-    # Проверяем, нет ли уже такого файла
     for track in library:
         if track.get("file_id") == file_id:
             return False
@@ -127,9 +126,8 @@ def get_stats(user_id: int) -> str:
     mood_list = ", ".join([f"{k}: {v}" for k, v in moods.items()])
     return f"📊 Записей: {len(entries)}\n❤️ Чаще всего: {most_common} ({moods[most_common]} раз)\n{mood_list}"
 
-# ========== СКАЧИВАНИЕ С YOUTUBE ==========
+# ========== СКАЧИВАНИЕ С YOUTUBE (С КУКИ) ==========
 async def download_audio(url: str):
-    """Скачивает аудио с YouTube и возвращает путь к файлу и информацию"""
     downloads_dir = "downloads"
     os.makedirs(downloads_dir, exist_ok=True)
     
@@ -138,6 +136,7 @@ async def download_audio(url: str):
         'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
+        'cookiefile': 'cookies.txt',  # КЛЮЧЕВАЯ СТРОКА — КУКИ!
         'extract_flat': False,
     }
     
@@ -147,7 +146,6 @@ async def download_audio(url: str):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            # Если файл .webm, переименуем в .m4a для лучшей совместимости
             if filename.endswith('.webm'):
                 new_filename = filename.replace('.webm', '.m4a')
                 os.rename(filename, new_filename)
@@ -189,24 +187,20 @@ async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         filename, title, performer = await download_audio(url)
         
-        # Отправляем аудио прямо в чат
         with open(filename, 'rb') as audio_file:
             message = await context.bot.send_audio(
                 chat_id=update.message.chat_id,
                 audio=audio_file,
-                title=title[:64],  # ограничение Telegram
+                title=title[:64],
                 performer=performer[:64],
                 caption=f"🎵 **Скачано с YouTube**\n{title}\n{performer}\n\n💾 Трек сохранён в библиотеку!",
                 parse_mode='Markdown'
             )
         
-        # Сохраняем в библиотеку
         file_id = message.audio.file_id
         add_to_library(title, performer, file_id)
         
-        # Удаляем временный файл
         os.remove(filename)
-        
         await status_msg.delete()
         
     except Exception as e:
@@ -419,6 +413,7 @@ def main():
     
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
+    print("🍪 YouTube cookies загружены")
     print("🎵 Поддержка YouTube через /yt")
     print("📁 Сохранение аудиофайлов в библиотеку")
     
