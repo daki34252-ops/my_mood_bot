@@ -35,7 +35,6 @@ YOUR_USER_ID = 8420827188
 
 DATA_FILE = "mood_diary.json"
 LIBRARY_FILE = "library.json"
-pending_ratings = {}
 
 def load_library():
     if os.path.exists(LIBRARY_FILE):
@@ -126,18 +125,25 @@ def get_stats(user_id: int) -> str:
     mood_list = ", ".join([f"{k}: {v}" for k, v in moods.items()])
     return f"📊 Записей: {len(entries)}\n❤️ Чаще всего: {most_common} ({moods[most_common]} раз)\n{mood_list}"
 
-# ========== СКАЧИВАНИЕ С YOUTUBE (С КУКИ) ==========
+# ========== СКАЧИВАНИЕ С YOUTUBE (ИСПРАВЛЕННОЕ) ==========
 async def download_audio(url: str):
     downloads_dir = "downloads"
     os.makedirs(downloads_dir, exist_ok=True)
     
+    # Используем формат bestaudio (без попыток объединения видео+аудио)
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio/best',  # Только аудио, лучшего качества
         'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
-        'cookiefile': 'cookies.txt',  # КЛЮЧЕВАЯ СТРОКА — КУКИ!
+        'cookiefile': 'cookies.txt',
         'extract_flat': False,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'prefer_ffmpeg': True,
     }
     
     loop = asyncio.get_event_loop()
@@ -145,11 +151,16 @@ async def download_audio(url: str):
     def download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if filename.endswith('.webm'):
-                new_filename = filename.replace('.webm', '.m4a')
-                os.rename(filename, new_filename)
-                filename = new_filename
+            # yt-dlp сам сконвертирует в mp3 благодаря postprocessor
+            filename = ydl.prepare_filename(info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            if not os.path.exists(filename):
+                # пробуем найти файл с другим расширением
+                base = os.path.splitext(filename)[0]
+                for ext in ['.mp3', '.m4a', '.webm']:
+                    test_name = base + ext
+                    if os.path.exists(test_name):
+                        filename = test_name
+                        break
             return filename, info.get('title', 'Без названия'), info.get('uploader', 'Неизвестный исполнитель')
     
     return await loop.run_in_executor(None, download)
@@ -187,6 +198,12 @@ async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         filename, title, performer = await download_audio(url)
         
+        # Проверяем, существует ли файл
+        if not os.path.exists(filename):
+            await status_msg.edit_text("❌ Не удалось найти скачанный файл.")
+            return
+        
+        # Отправляем аудио
         with open(filename, 'rb') as audio_file:
             message = await context.bot.send_audio(
                 chat_id=update.message.chat_id,
@@ -197,9 +214,12 @@ async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         
-        file_id = message.audio.file_id
-        add_to_library(title, performer, file_id)
+        # Сохраняем в библиотеку
+        if hasattr(message, 'audio') and message.audio:
+            file_id = message.audio.file_id
+            add_to_library(title, performer, file_id)
         
+        # Удаляем временный файл
         os.remove(filename)
         await status_msg.delete()
         
@@ -398,6 +418,14 @@ def main():
         print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
         return
     
+    # Обновляем yt-dlp до последней версии
+    try:
+        import subprocess
+        subprocess.run(['pip', 'install', '--upgrade', 'yt-dlp'], capture_output=True)
+        print("✅ yt-dlp обновлён до последней версии")
+    except:
+        print("⚠️ Не удалось обновить yt-dlp автоматически")
+    
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("yt", yt_command))
@@ -413,9 +441,7 @@ def main():
     
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
-    print("🍪 YouTube cookies загружены")
-    print("🎵 Поддержка YouTube через /yt")
-    print("📁 Сохранение аудиофайлов в библиотеку")
+    print("🎵 Поддержка YouTube через /yt (формат mp3)")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
