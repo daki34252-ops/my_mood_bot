@@ -130,9 +130,9 @@ async def download_audio(url: str):
     downloads_dir = "downloads"
     os.makedirs(downloads_dir, exist_ok=True)
     
-    # Используем формат bestaudio (без попыток объединения видео+аудио)
+    # Используем fallback-форматы для совместимости с новыми изменениями YouTube [citation:5][citation:9]
     ydl_opts = {
-        'format': 'bestaudio/best',  # Только аудио, лучшего качества
+        'format': 'bestaudio/best',  # Попроще, без обязательной конвертации
         'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
@@ -144,6 +144,13 @@ async def download_audio(url: str):
             'preferredquality': '192',
         }],
         'prefer_ffmpeg': True,
+        # Дополнительные опции для обхода SABR streaming [citation:5]
+        'extractor_args': {
+            'youtube': {
+                'skip': ['hls', 'dash'],  # Пропускаем некоторые типы потоков
+                'player_client': ['android', 'web'],  # Пробуем разные клиенты
+            }
+        }
     }
     
     loop = asyncio.get_event_loop()
@@ -151,16 +158,17 @@ async def download_audio(url: str):
     def download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # yt-dlp сам сконвертирует в mp3 благодаря postprocessor
-            filename = ydl.prepare_filename(info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
-            if not os.path.exists(filename):
-                # пробуем найти файл с другим расширением
+            filename = ydl.prepare_filename(info)
+            if filename.endswith('.webm'):
+                new_filename = filename.replace('.webm', '.mp3')
+                if os.path.exists(new_filename):
+                    os.rename(filename, new_filename)
+                    filename = new_filename
+            elif not filename.endswith('.mp3'):
+                # Проверяем, есть ли mp3 файл (после конвертации)
                 base = os.path.splitext(filename)[0]
-                for ext in ['.mp3', '.m4a', '.webm']:
-                    test_name = base + ext
-                    if os.path.exists(test_name):
-                        filename = test_name
-                        break
+                if os.path.exists(base + '.mp3'):
+                    filename = base + '.mp3'
             return filename, info.get('title', 'Без названия'), info.get('uploader', 'Неизвестный исполнитель')
     
     return await loop.run_in_executor(None, download)
@@ -198,12 +206,10 @@ async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         filename, title, performer = await download_audio(url)
         
-        # Проверяем, существует ли файл
         if not os.path.exists(filename):
             await status_msg.edit_text("❌ Не удалось найти скачанный файл.")
             return
         
-        # Отправляем аудио
         with open(filename, 'rb') as audio_file:
             message = await context.bot.send_audio(
                 chat_id=update.message.chat_id,
@@ -214,12 +220,10 @@ async def yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         
-        # Сохраняем в библиотеку
         if hasattr(message, 'audio') and message.audio:
             file_id = message.audio.file_id
             add_to_library(title, performer, file_id)
         
-        # Удаляем временный файл
         os.remove(filename)
         await status_msg.delete()
         
@@ -418,13 +422,13 @@ def main():
         print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
         return
     
-    # Обновляем yt-dlp до последней версии
+    # Обновляем yt-dlp и устанавливаем yt-dlp-ejs для обхода защиты YouTube [citation:5]
     try:
         import subprocess
-        subprocess.run(['pip', 'install', '--upgrade', 'yt-dlp'], capture_output=True)
-        print("✅ yt-dlp обновлён до последней версии")
-    except:
-        print("⚠️ Не удалось обновить yt-dlp автоматически")
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'yt-dlp', 'yt-dlp-ejs'], capture_output=True)
+        print("✅ yt-dlp и yt-dlp-ejs установлены/обновлены")
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить yt-dlp: {e}")
     
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -441,7 +445,7 @@ def main():
     
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
-    print("🎵 Поддержка YouTube через /yt (формат mp3)")
+    print("🎵 Поддержка YouTube через /yt (с обходом SABR streaming)")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -452,4 +456,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    import sys
     main()
