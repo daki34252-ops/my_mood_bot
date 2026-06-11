@@ -110,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 **Твой дневник настроения с музыкой**\n\n"
         "/mood — записать настроение + получить трек\n"
         "/random — случайный трек\n"
-        "/addfile — добавить новую песню\n"
+        "/addfile — добавить новую песню (можно несколько за раз)\n"
         "/cancel — выйти из режима добавления\n"
         "/stats — статистика дневника\n"
         "/ratings — топ треков по оценкам\n"
@@ -148,7 +148,7 @@ async def addmood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_tracks[query.from_user.id] = mood
     await query.edit_message_text(
         f"✅ Выбрано настроение: **{mood}**\n\n"
-        f"📤 Теперь **отправь аудиофайл(ы)** (можно несколько)\n\n"
+        f"📤 Теперь **отправь аудиофайл(ы)** (можно несколько, пачкой или по одному)\n\n"
         f"❌ Чтобы выйти — /cancel",
         parse_mode="Markdown"
     )
@@ -177,7 +177,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     mood = pending_tracks[user_id]
     
-    # Собираем все аудио
+    # Собираем все аудио из сообщения
     audios = []
     if update.message.audio:
         audios.append(update.message.audio)
@@ -188,7 +188,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Отправь аудиофайл(ы)")
         return
     
-    saved_count = 0
+    # Сообщаем, что началась обработка
+    status_msg = await update.message.reply_text(f"⏳ Обрабатываю {len(audios)} треков...")
+    
+    # Собираем все треки в список
+    new_tracks = []
     saved_titles = []
     
     for audio in audios:
@@ -196,23 +200,26 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         performer = audio.performer or ""
         full_title = f"{performer} - {title}" if performer else title
         
-        data = load_data()
-        
         track_info = {
             "file_id": audio.file_id,
             "title": full_title,
             "performer": performer,
             "file_name": audio.file_name
         }
-        
-        # Сохраняем ВСЕГДА, даже если дубликат (убираем проверку)
-        data["tracks"][mood].append(track_info)
-        save_data(data)
-        saved_count += 1
+        new_tracks.append(track_info)
         saved_titles.append(full_title)
-        
-        # Небольшая задержка, чтобы файлы точно сохранились
-        time.sleep(0.1)
+    
+    # ОДИН РАЗ загружаем данные
+    data = load_data()
+    
+    # ОДИН РАЗ добавляем все треки
+    data["tracks"][mood].extend(new_tracks)
+    
+    # ОДИН РАЗ сохраняем
+    save_data(data)
+    
+    # Удаляем сообщение о статусе
+    await status_msg.delete()
     
     # Показываем результат
     titles_preview = "\n".join(saved_titles[:10])
@@ -221,7 +228,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"🎵 **Добавление в «{mood}»**\n\n"
-        f"✅ Сохранено треков: {saved_count}\n\n"
+        f"✅ Сохранено треков: {len(new_tracks)}\n\n"
         f"📝 {titles_preview}\n\n"
         f"🎶 Режим добавления активен. Отправляй ещё!\n"
         f"❌ Выход — /cancel",
@@ -342,11 +349,11 @@ async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     rating_keyboard = [
         [
-            InlineKeyboardButton(" 1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton(" 2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton(" 3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton(" 4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton(" 5", callback_data=f"rate_5_{track['title']}")
+            InlineKeyboardButton("⭐ 1", callback_data=f"rate_1_{track['title']}"),
+            InlineKeyboardButton("⭐⭐ 2", callback_data=f"rate_2_{track['title']}"),
+            InlineKeyboardButton("⭐⭐⭐ 3", callback_data=f"rate_3_{track['title']}"),
+            InlineKeyboardButton("⭐⭐⭐⭐ 4", callback_data=f"rate_4_{track['title']}"),
+            InlineKeyboardButton("⭐⭐⭐⭐⭐ 5", callback_data=f"rate_5_{track['title']}")
         ]
     ]
     
@@ -437,7 +444,7 @@ def main():
     print("🤖 Бот запущен на Render!")
     print("🛡️ Автопинг каждые 14 минут включён")
     print("⭐ Оценки треков через звёздочки — активны")
-    print("📁 Сохранение всех файлов (включая дубликаты) — активно")
+    print("📁 Пакетное сохранение треков — активно")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
