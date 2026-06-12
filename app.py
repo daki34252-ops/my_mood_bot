@@ -2,20 +2,21 @@ import os
 import json
 import random
 import time
-from datetime import datetime
+import re
+import requests
+from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from telegram.error import TelegramError
-import requests
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ========== ЗАГЛУШКА ДЛЯ RENDER ==========
 app_web = Flask(__name__)
 
 @app_web.route('/')
 def hello():
-    return "🤖 Бот с музыкой работает!"
+    return "🤖 Дневник эмоций работает!"
 
 @app_web.route('/health')
 def health():
@@ -29,374 +30,241 @@ def ping():
 # ========== КОНФИГУРАЦИЯ ==========
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 YOUR_USER_ID = 8420827188
+HF_TOKEN = os.environ.get("HF_TOKEN")  # токен из переменной окружения!
 # =================================
 
-DATA_FILE = "mood_diary.json"
-LIBRARY_FILE = "library.json"
+DATA_FILE = "diary.json"
 
-def load_library():
-    if os.path.exists(LIBRARY_FILE):
-        with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []  # [{"type": "audio" или "link", "title": "...", "value": "file_id или ссылка", "performer": "...", "date_added": "..."}]
-
-def save_library(library):
-    with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(library, f, ensure_ascii=False, indent=2)
-
-def load_diary():
+def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"users": {}, "ratings": {}}
+    return {"entries": []}
 
-def save_diary(data):
+def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def add_to_library(item_type: str, title: str, performer: str, value: str):
-    library = load_library()
-    for track in library:
-        if track.get("value") == value:
-            return False
-    library.append({
-        "type": item_type,
-        "title": title,
-        "performer": performer,
-        "value": value,
-        "date_added": datetime.now().strftime("%Y-%m-%d")
-    })
-    save_library(library)
-    return True
-
-def get_random_track():
-    library = load_library()
-    if not library:
-        return None
-    return random.choice(library)
-
-def add_rating(track_title: str, rating: int):
-    data = load_diary()
-    if "ratings" not in data:
-        data["ratings"] = {}
-    if track_title not in data["ratings"]:
-        data["ratings"][track_title] = []
-    data["ratings"][track_title].append(rating)
-    save_diary(data)
-
-def get_random_caption(mood: str, track_title: str) -> str:
-    captions = {
-        "грустный": [f"🍂 Под грустинку — {track_title}. Выдохни.", f"😔 Грусть — это нормально. {track_title} — твой саундтрек."],
-        "весёлый": [f"🎉 {track_title} — энергия зашкаливает!", f"😄 Этот трек про тебя сегодня! {track_title}"],
-        "злой": [f"🤬 Выпусти пар под {track_title}. Громкость на максимум.", f"⚡ Злость — топливо. {track_title} в помощь."],
-        "спокойный": [f"😌 {track_title} — музыка для внутреннего равновесия.", f"🌊 Расслабься. {track_title} тебя ждёт."],
-        "влюблённый": [f"💘 {track_title} — это про тебя и твои чувства.", f"🌸 Весна в душе? {track_title} подтверждает."],
-        "уставший": [f"🛌 {track_title} — ложись и слушай.", f"😴 Устал? {track_title} обнимет звуком."],
-        "случайное": [f"🎲 Держи случайный трек: {track_title}", f"🎧 Бот выбрал за тебя — {track_title}"],
-    }
-    return random.choice(captions.get(mood, captions["случайное"]))
-
-def save_mood_entry(user_id: int, mood: str, track_title: str):
-    data = load_diary()
-    uid = str(user_id)
-    if uid not in data["users"]:
-        data["users"][uid] = {"entries": []}
+def analyze_with_ai(text: str):
+    if not HF_TOKEN:
+        # Если нет токена, используем fallback
+        moods = ["радость", "грусть", "спокойствие", "усталость", "вдохновение"]
+        return random.choice(moods), "Спасибо, что поделилась. Твои чувства важны 💚"
     
-    data["users"][uid]["entries"].append({
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "time": datetime.now().strftime("%H:%M"),
-        "mood": mood,
-        "track_title": track_title
-    })
-    save_diary(data)
+    try:
+        API_URL = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        
+        prompt = f"""Ты — заботливый друг. Прочитай запись и определи настроение (радость, грусть, злость, спокойствие, тревога, вдохновение, усталость, любовь). Напиши короткий поддерживающий ответ.
 
-def get_stats(user_id: int) -> str:
-    data = load_diary()
-    entries = data["users"].get(str(user_id), {}).get("entries", [])
-    if not entries:
-        return "📭 Дневник пуст. Нажми /mood"
-    
-    moods = {}
-    for e in entries:
-        moods[e["mood"]] = moods.get(e["mood"], 0) + 1
-    
-    most_common = max(moods, key=moods.get)
-    mood_list = ", ".join([f"{k}: {v}" for k, v in moods.items()])
-    return f"📊 Записей: {len(entries)}\n❤️ Чаще всего: {most_common} ({moods[most_common]} раз)\n{mood_list}"
+Запись: "{text}"
 
-# ========== КОМАНДЫ ==========
+Формат ответа:
+Настроение: [слово]
+Поддержка: [твой ответ]"""
+
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                ai_text = result[0].get("generated_text", "")
+                mood_match = re.search(r'Настроение:\s*(.+)', ai_text)
+                support_match = re.search(r'Поддержка:\s*(.+)', ai_text)
+                mood = mood_match.group(1).strip() if mood_match else "не определено"
+                support = support_match.group(1).strip() if support_match else "Ты молодец! Я рядом 💚"
+                return mood, support
+    except Exception as e:
+        print(f"Ошибка: {e}")
+    
+    moods = ["радость", "грусть", "спокойствие", "усталость", "вдохновение"]
+    return random.choice(moods), "Спасибо, что поделилась. Твои чувства важны 💚"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
-        await update.message.reply_text("Это личный бот 🙈")
+        await update.message.reply_text("Это личный дневник 🙈")
         return
     await update.message.reply_text(
-        "🎧 **Твой дневник настроения с музыкой**\n\n"
-        "/mood — записать настроение + получить трек\n"
-        "/random — случайный трек\n"
-        "/addlink — добавить ссылку на песню\n"
-        "/library — количество треков/ссылок в библиотеке\n"
-        "/ratings — топ треков по оценкам\n"
-        "/stats — статистика дневника\n"
-        "/history — последние записи\n\n"
-        "🎵 Отправь аудиофайл — бот сохранит его в библиотеку!\n"
-        "🔗 Используй /addlink, чтобы добавить ссылку\n"
-        "⭐ Оцени трек от 1 до 5 после прослушивания!",
+        "📔 **Твой дневник эмоций**\n\n"
+        "/note [текст] — написать заметку\n"
+        "/mood — быстро отметить настроение\n"
+        "/week — итоги недели\n"
+        "/stats — статистика\n"
+        "/history — последние записи\n"
+        "/advice — получить поддержку\n\n"
+        "Я анализирую твои записи и поддерживаю тебя 💚",
         parse_mode="Markdown"
     )
 
-async def addlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
     
     if not context.args:
-        await update.message.reply_text("❌ Использование: `/addlink https://youtu.be/... Название трека`\n\nПример: `/addlink https://youtu.be/dQw4w9WgXcQ Rick Astley - Never Gonna Give You Up`", parse_mode="Markdown")
+        await update.message.reply_text("Пример: `/note Сегодня был хороший день`", parse_mode="Markdown")
         return
     
-    url = context.args[0]
-    if len(context.args) > 1:
-        title = " ".join(context.args[1:])
-    else:
-        title = url
+    text = " ".join(context.args)
+    status_msg = await update.message.reply_text("📖 Анализирую...")
     
-    if add_to_library("link", title, "Ссылка", url):
-        await update.message.reply_text(f"✅ Ссылка сохранена в библиотеку!\n🔗 {title}\n{url}")
-    else:
-        await update.message.reply_text(f"⚠️ Такая ссылка уже есть в библиотеке")
+    mood, support = analyze_with_ai(text)
+    
+    data = load_data()
+    data["entries"].append({
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M"),
+        "text": text,
+        "mood": mood,
+        "ai_response": support
+    })
+    save_data(data)
+    
+    await status_msg.delete()
+    await update.message.reply_text(
+        f"📔 **Запись сохранена!**\n"
+        f"😊 Настроение: {mood}\n\n"
+        f"💚 {support}",
+        parse_mode="Markdown"
+    )
 
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quick_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
     
-    audio = update.message.audio
-    if not audio:
-        return
-    
-    title = audio.title or audio.file_name or "Без названия"
-    performer = audio.performer or "Неизвестный исполнитель"
-    file_id = audio.file_id
-    
-    if add_to_library("audio", title, performer, file_id):
-        await update.message.reply_text(f"✅ Трек сохранён в библиотеку!\n🎵 {title} — {performer}")
-    else:
-        await update.message.reply_text(f"⚠️ Трек уже есть в библиотеке")
-
-async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        return
     keyboard = [
-        [InlineKeyboardButton("😢 Грустный", callback_data="mood_грустный")],
-        [InlineKeyboardButton("😄 Весёлый", callback_data="mood_весёлый")],
-        [InlineKeyboardButton("🤬 Злой", callback_data="mood_злой")],
-        [InlineKeyboardButton("😌 Спокойный", callback_data="mood_спокойный")],
-        [InlineKeyboardButton("💘 Влюблённый", callback_data="mood_влюблённый")],
-        [InlineKeyboardButton("🛌 Уставший", callback_data="mood_уставший")],
+        [InlineKeyboardButton("😊 Радость", callback_data="mood_радость")],
+        [InlineKeyboardButton("😢 Грусть", callback_data="mood_грусть")],
+        [InlineKeyboardButton("🤬 Злость", callback_data="mood_злость")],
+        [InlineKeyboardButton("😌 Спокойствие", callback_data="mood_спокойствие")],
+        [InlineKeyboardButton("😰 Тревога", callback_data="mood_тревога")],
     ]
-    await update.message.reply_text("Какое у тебя настроение?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Как ты себя чувствуешь?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.from_user.id != YOUR_USER_ID:
-        await query.edit_message_text("Это не твой бот 🙈")
         return
     
     mood = query.data.replace("mood_", "")
-    track = get_random_track()
-    if not track:
-        await query.edit_message_text("📭 Библиотека пуста. Добавь треки через /addlink или отправь аудиофайл.")
-        return
     
-    caption = get_random_caption(mood, track["title"])
-    save_mood_entry(YOUR_USER_ID, mood, track["title"])
+    data = load_data()
+    data["entries"].append({
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M"),
+        "text": "",
+        "mood": mood,
+        "ai_response": f"Ты отметила {mood}. Я рядом 💚"
+    })
+    save_data(data)
     
-    rating_keyboard = [
-        [
-            InlineKeyboardButton("1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton("2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton("3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton("4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton("5", callback_data=f"rate_5_{track['title']}")
-        ]
-    ]
-    
-    try:
-        if track["type"] == "audio":
-            await context.bot.send_audio(
-                chat_id=query.message.chat_id,
-                audio=track["value"],
-                caption=f"{caption}\n\n🎵 {track['title']} — {track['performer']}\n\n⭐ **Оцени трек от 1 до 5:**",
-                performer=track.get("performer", ""),
-                title=track.get("title", ""),
-                reply_markup=InlineKeyboardMarkup(rating_keyboard)
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"{caption}\n\n🔗 **Ссылка:** {track['value']}\n\n⭐ **Оцени трек от 1 до 5:**",
-                reply_markup=InlineKeyboardMarkup(rating_keyboard),
-                parse_mode='Markdown'
-            )
-        await query.message.delete()
-    except TelegramError as e:
-        await query.edit_message_text(f"❌ Ошибка: {e}")
+    await query.edit_message_text(f"✅ Отметка сохранена! Настроение: {mood}")
 
-async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.from_user.id != YOUR_USER_ID:
-        await query.edit_message_text("Это не твой бот 🙈")
-        return
-    
-    data_parts = query.data.split("_")
-    rating = int(data_parts[1])
-    track_title = "_".join(data_parts[2:])
-    
-    add_rating(track_title, rating)
-    
-    await query.edit_message_text(
-        f"✅ **Оценка сохранена!**\n\n"
-        f"🎵 {track_title}\n"
-        f"⭐ Твоя оценка: {rating}/5\n\n"
-        f"Спасибо! ❤️",
-        parse_mode="Markdown"
-    )
-
-async def random_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
     
-    track = get_random_track()
-    if not track:
-        await update.message.reply_text("📭 Библиотека пуста. Добавь треки через /addlink или отправь аудиофайл.")
+    data = load_data()
+    week_ago = datetime.now() - timedelta(days=7)
+    week_entries = []
+    for e in data["entries"]:
+        try:
+            if datetime.strptime(e["date"], "%Y-%m-%d") >= week_ago:
+                week_entries.append(e)
+        except:
+            pass
+    
+    if not week_entries:
+        await update.message.reply_text("За эту неделю нет записей.")
         return
     
-    caption = get_random_caption("случайное", track["title"])
+    mood_count = {}
+    for e in week_entries:
+        mood_count[e["mood"]] = mood_count.get(e["mood"], 0) + 1
     
-    rating_keyboard = [
-        [
-            InlineKeyboardButton("1", callback_data=f"rate_1_{track['title']}"),
-            InlineKeyboardButton("2", callback_data=f"rate_2_{track['title']}"),
-            InlineKeyboardButton("3", callback_data=f"rate_3_{track['title']}"),
-            InlineKeyboardButton("4", callback_data=f"rate_4_{track['title']}"),
-            InlineKeyboardButton("5", callback_data=f"rate_5_{track['title']}")
-        ]
-    ]
+    report = f"📊 **Неделя в цифрах**\n\n"
+    for mood, count in mood_count.items():
+        bar = "█" * min(count, 10)
+        report += f"{mood}: {bar} {count}\n"
     
-    try:
-        if track["type"] == "audio":
-            await context.bot.send_audio(
-                chat_id=update.message.chat_id,
-                audio=track["value"],
-                caption=f"{caption}\n\n🎵 {track['title']} — {track['performer']}\n\n⭐ **Оцени трек от 1 до 5:**",
-                performer=track.get("performer", ""),
-                title=track.get("title", ""),
-                reply_markup=InlineKeyboardMarkup(rating_keyboard)
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=update.message.chat_id,
-                text=f"{caption}\n\n🔗 **Ссылка:** {track['value']}\n\n⭐ **Оцени трек от 1 до 5:**",
-                reply_markup=InlineKeyboardMarkup(rating_keyboard),
-                parse_mode='Markdown'
-            )
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        return
-    
-    library = load_library()
-    audio_count = len([t for t in library if t["type"] == "audio"])
-    link_count = len([t for t in library if t["type"] == "link"])
-    total = len(library)
-    
-    await update.message.reply_text(
-        f"📚 **Твоя библиотека:**\n\n"
-        f"🎵 Аудиофайлов: {audio_count}\n"
-        f"🔗 Ссылок: {link_count}\n"
-        f"📊 Всего треков: {total}",
-        parse_mode="Markdown"
-    )
-
-async def ratings_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        return
-    
-    data = load_diary()
-    if not data.get("ratings"):
-        await update.message.reply_text("📭 Пока нет оценок.")
-        return
-    
-    stats = []
-    for track, ratings in data["ratings"].items():
-        avg = sum(ratings) / len(ratings)
-        stats.append(f"• {track}: {avg:.1f}/5 ({len(ratings)} оценок)")
-    
-    stats.sort(key=lambda x: float(x.split(": ")[1].split("/")[0]), reverse=True)
-    top_stats = stats[:10]
-    
-    await update.message.reply_text(
-        "📊 **Топ треков по оценкам:**\n\n" + "\n".join(top_stats),
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(report, parse_mode="Markdown")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    await update.message.reply_text(get_stats(YOUR_USER_ID))
+    
+    data = load_data()
+    entries = data["entries"]
+    if not entries:
+        await update.message.reply_text("Дневник пуст.")
+        return
+    
+    mood_count = {}
+    for e in entries:
+        mood_count[e["mood"]] = mood_count.get(e["mood"], 0) + 1
+    
+    report = f"📊 **Всего записей:** {len(entries)}\n\n"
+    for mood, count in mood_count.items():
+        report += f"{mood}: {count}\n"
+    
+    await update.message.reply_text(report, parse_mode="Markdown")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    data = load_diary()
-    entries = data["users"].get(str(YOUR_USER_ID), {}).get("entries", [])[-5:]
-    if not entries:
-        await update.message.reply_text("Дневник пуст")
+    
+    data = load_data()
+    last_five = data["entries"][-5:][::-1]
+    
+    if not last_five:
+        await update.message.reply_text("Дневник пуст.")
         return
-    text = "📜 **Последние 5 записей:**\n"
-    for e in reversed(entries):
-        text += f"\n• {e['date']} {e['time']} — {e['mood']}\n  🎵 {e['track_title']}"
+    
+    text = "📜 **Последние записи:**\n\n"
+    for e in last_five:
+        preview = e["text"][:80] + "..." if len(e["text"]) > 80 else e["text"] if e["text"] else "Быстрая отметка"
+        text += f"📅 {e['date']} — {e['mood']}\n   {preview}\n\n"
+    
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ========== АВТОПИНГ ==========
+async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💚 **Совет дня:**\n\n"
+        "Твои чувства — это не хорошо и не плохо. Они просто есть.\n"
+        "Позволь себе быть любой. Ты уже делаешь большой шаг, записывая их 💚"
+    )
+
 def keep_alive():
-    url = f"https://{os.environ.get('RENDER_SERVICE_NAME', 'my-mood-bot')}.onrender.com/ping"
+    url = f"https://{os.environ.get('RENDER_SERVICE_NAME', 'my-diary-bot')}.onrender.com/ping"
     while True:
         time.sleep(14 * 60)
         try:
             requests.get(url, timeout=10)
-            print("🔄 Автопинг: бот разбужен")
-        except Exception as e:
-            print(f"❌ Ошибка автопинга: {e}")
+            print("🔄 Пинг")
+        except:
+            pass
 
 def run_flask():
     app_web.run(host='0.0.0.0', port=10000)
 
-# ========== ЗАПУСК ==========
 def main():
     if not BOT_TOKEN:
-        print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
+        print("❌ Нет TELEGRAM_TOKEN!")
         return
+    
+    if not HF_TOKEN:
+        print("⚠️ Нет HF_TOKEN! Нейросеть не будет работать, но бот запустится.")
     
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addlink", addlink_command))
-    app.add_handler(CommandHandler("mood", mood_command))
-    app.add_handler(CommandHandler("random", random_track))
-    app.add_handler(CommandHandler("library", library_command))
-    app.add_handler(CommandHandler("ratings", ratings_stats_command))
+    app.add_handler(CommandHandler("note", note_command))
+    app.add_handler(CommandHandler("mood", quick_mood))
+    app.add_handler(CommandHandler("week", week_report))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("advice", advice_command))
     app.add_handler(CallbackQueryHandler(mood_callback, pattern="^mood_"))
-    app.add_handler(CallbackQueryHandler(rating_callback, pattern="^rate_"))
-    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     
-    print("🤖 Бот запущен на Render!")
-    print("🛡️ Автопинг каждые 14 минут включён")
-    print("🎵 Сохранение аудиофайлов и ссылок")
-    print("⭐ Оценки от 1 до 5")
+    print("🤖 Дневник эмоций запущен!")
     
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
